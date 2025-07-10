@@ -1,86 +1,71 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_openai import ChatOpenAI
-from langchain.tools import Tool
-from langchain.agents import create_openai_tools_agent, AgentExecutor
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from dotenv import load_dotenv
+from langchain_community.chat_models import ChatOllama
 import requests
-import os
 
-# Load API key from .env
-load_dotenv()
-openai_key = os.getenv("OPENAI_API_KEY")
-org_id = os.getenv("OPENAI_ORGANIZATION_ID")
-print("-"*100)
-print(org_id)
 app = FastAPI()
 
-# Allow your React frontend to talk to this server
+# CORS for React
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # or your deployed domain
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Chat request model
 class Query(BaseModel):
     user_input: str
 
-# Tool: Search items from your Node backend
-def search_items(query: str) -> str:
-    """Search for items in the donation pool based on user input."""
+# API tool to call Node backend
+def search_items_from_api(name: str) -> str:
     try:
-        res = requests.get(f"http://localhost:5000/items?q={query}")
-        items = res.json()
-        if not items:
-            return "No matching items found in the donation pool."
-        return "Here are some items you might like:\n" + "\n".join(i["name"] for i in items)
+        res = requests.get(f"http://localhost:5000/items?q={name}")
+        res_data = res.json()
+        if not res_data.get("success") or not res_data.get("data"):
+            return "Sorry, no items found that match your search."
+
+        items = res_data["data"]
+        response = "Here are the items I found:\n\n"
+        for item in items:
+            response += f"- **{item['name']}** ({item['category']}): {item['description']} — ₹{item['price']}\n"
+        return response
+
     except Exception as e:
-        return f"Error while searching items: {str(e)}"
+        return f"Error while searching: {str(e)}"
 
 @app.post("/chat")
 async def chat(query: Query):
-    # Initialize the LLM
-    llm = ChatOpenAI(
-        model="gpt-3.5-turbo",
-        temperature=0.7,
-        openai_api_key=openai_key,
-        organization=org_id
-    )
+    user_input = query.user_input
+    llm = ChatOllama(model="llama3.2-1b:latest", temperature=0.3)
 
-    # Create tools
-    tools = [
-        Tool(
-            name="SearchItems",
-            func=search_items,
-            description="Search for items in the donation pool (listed products) based on user input.",
-        ),
-    ]
+    # Step 1: System-guided prompt to check if tool needed
+    classification_prompt = f"""
+You are an assistant that helps users with donation-related queries.
 
-    # Create a prompt template
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful assistant that can search for items in a donation pool. Use the SearchItems tool when users ask about finding or looking for specific items."),
-        ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad"),
-    ])
+If the user's question is about searching for an item (like "Do you have shoes?" or "I need a laptop"), respond ONLY with:
 
-    # Create the agent
-    agent = create_openai_tools_agent(llm, tools, prompt)
-    
-    # Create agent executor
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-    
-    # Run the agent with the new invoke method
-    try:
-        response = agent_executor.invoke({"input": query.user_input})
-        return {"response": response["output"]}
-    except Exception as e:
-        return {"response": f"Error processing your request: {str(e)}"}
+USE_SEARCH_TOOL
+tool_input: <exact keyword to search>
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+If the query is general (not about items), just answer conversationally.
+
+Now here's the user input:
+"{user_input}"
+"""
+    decision = llm.invoke(classification_prompt).content.strip()
+
+    if decision.startswith("USE_SEARCH_TOOL"):
+        # Step 2: Extract tool input
+        try:
+            search_term = decision.split("tool_input:")[1].strip().strip('"')
+            items_response = search_items_from_api(search_term)
+            return {"response": items_response}
+        except Exception as e:
+            return {"response": f"Error parsing tool input: {str(e)}"}
+
+    else:
+        # No tool needed, respond normally
+        chat_response = llm.invoke(user_input).content
+        return {"response": chat_response}
